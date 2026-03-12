@@ -7,33 +7,17 @@ SUMO Scenario Dashboard
 Interactive Streamlit dashboard to build a SUMO simulation scenario starting
 from mapped TLC CSV measurements.
 
-Main workflow:
-1. Read the CSV->POI->edge mapping (poi_edge_mapping.csv).
-2. Scan only the mapped CSV files and extract the available dates / hourly slots.
-3. Let the user pick a valid date and a one-hour time slot.
-4. Build one edgeData XML per traffic mode for the selected hour.
-5. Estimate the default modal split from the measured counts.
-6. Let the user choose a total number of vehicles and rebalance the modal split
-   with sliders while keeping the total fixed.
-7. Generate:
-   - types.add.xml
-   - one route file per mode via randomTrips.py + routeSampler.py
-   - a SUMO config file
-8. Optionally launch SUMO or SUMO-GUI.
-
-The app is self-contained and does not require the earlier helper scripts,
-although it follows the same logic and file formats.
-
 Run with:
-    streamlit run sumo_scenario_dashboard.py
+    streamlit run sumo_scenario_dashboard_fixed.py
 """
 
 from __future__ import annotations
 
 import math
+import os
+import shutil
 import subprocess
 import sys
-import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,18 +26,6 @@ from typing import Dict, List, Tuple
 import pandas as pd
 import streamlit as st
 
-
-if "mode_edge_counts" not in st.session_state:
-    st.session_state["mode_edge_counts"] = None
-
-if "used_df" not in st.session_state:
-    st.session_state["used_df"] = None
-
-if "selected_date" not in st.session_state:
-    st.session_state["selected_date"] = None
-
-if "selected_hour" not in st.session_state:
-    st.session_state["selected_hour"] = None
 
 # ============================================================================
 # CONFIGURATION
@@ -64,6 +36,7 @@ DEFAULTS = {
     "sumo_tools_path": r"C:/Program Files (x86)/Eclipse/Sumo/tools",
     "sumo_bin_dir": r"C:/Program Files (x86)/Eclipse/Sumo/bin",
     "net_file": str(BASE_DIR / "sumo_data" / "osm.net.xml"),
+    "base_sumocfg": str(BASE_DIR / "sumo_data" / "osm.sumocfg"),
     "poi_edge_mapping": str(BASE_DIR / "pre-processing" / "poi_edge_mapping.csv"),
     "csv_dir": str(BASE_DIR / "sensor_measures_castellammare"),
     "output_dir": str(BASE_DIR / "scenario_output"),
@@ -117,6 +90,21 @@ PYTHON_EXE = sys.executable
 
 
 # ============================================================================
+# SESSION STATE INIT
+# ============================================================================
+if "mode_edge_counts" not in st.session_state:
+    st.session_state["mode_edge_counts"] = None
+if "used_df" not in st.session_state:
+    st.session_state["used_df"] = None
+if "selected_date" not in st.session_state:
+    st.session_state["selected_date"] = None
+if "selected_hour" not in st.session_state:
+    st.session_state["selected_hour"] = None
+if "modal_percentages" not in st.session_state:
+    st.session_state["modal_percentages"] = None
+
+
+# ============================================================================
 # DATA STRUCTURES
 # ============================================================================
 @dataclass
@@ -124,6 +112,7 @@ class ScenarioPaths:
     root: Path
     edgedata_dir: Path
     routes_dir: Path
+    output_dir: Path
     types_file: Path
     sumocfg_file: Path
 
@@ -139,35 +128,116 @@ def run_cmd(cmd: List[str], desc: str) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, text=True, capture_output=True, check=False)
 
 
-def normalize_weights_to_total(weights: Dict[str, int], total: int) -> Dict[str, int]:
-    if total <= 0:
-        return {k: 0 for k in weights}
+def parse_timestamp_column(df: pd.DataFrame) -> pd.Series:
+    return pd.to_datetime(df["Data e Ora"], format="%d/%m/%Y - %H:%M:%S", errors="coerce")
 
-    raw_sum = sum(max(0, int(v)) for v in weights.values())
-    if raw_sum == 0:
-        keys = list(weights.keys())
+
+def normalize_percentages_to_100(percentages: Dict[str, float]) -> Dict[str, int]:
+    keys = list(percentages.keys())
+    clipped = {k: max(0.0, min(100.0, float(v))) for k, v in percentages.items()}
+    total = sum(clipped.values())
+
+    if total <= 0:
         out = {k: 0 for k in keys}
         if keys:
-            out[keys[0]] = total
+            out[keys[0]] = 100
         return out
 
-    scaled = {k: (max(0, int(v)) / raw_sum) * total for k, v in weights.items()}
+    scaled = {k: clipped[k] * 100.0 / total for k in keys}
     floored = {k: int(math.floor(v)) for k, v in scaled.items()}
-    remainder = total - sum(floored.values())
+    remainder = 100 - sum(floored.values())
 
-    # distribute remainder to largest fractional parts
-    fractions = sorted(
-        ((k, scaled[k] - floored[k]) for k in scaled),
-        key=lambda x: x[1],
-        reverse=True,
-    )
+    order = sorted(keys, key=lambda k: scaled[k] - floored[k], reverse=True)
     for i in range(remainder):
-        floored[fractions[i % len(fractions)][0]] += 1
+        floored[order[i % len(order)]] += 1
+
     return floored
 
 
-def parse_timestamp_column(df: pd.DataFrame) -> pd.Series:
-    return pd.to_datetime(df["Data e Ora"], format="%d/%m/%Y - %H:%M:%S", errors="coerce")
+def rebalance_percentages(changed_key: str, new_value: int, current: Dict[str, int]) -> Dict[str, int]:
+    keys = list(current.keys())
+    new_value = max(0, min(100, int(new_value)))
+
+    if changed_key not in current:
+        return current.copy()
+
+    others = [k for k in keys if k != changed_key]
+    remaining = 100 - new_value
+
+    if remaining <= 0:
+        return {k: (100 if k == changed_key else 0) for k in keys}
+
+    others_sum = sum(current[k] for k in others)
+    if others_sum <= 0:
+        out = {k: 0 for k in keys}
+        out[changed_key] = new_value
+        if others:
+            base = remaining // len(others)
+            rem = remaining % len(others)
+            for i, k in enumerate(others):
+                out[k] = base + (1 if i < rem else 0)
+        return out
+
+    scaled = {k: current[k] * remaining / others_sum for k in others}
+    floored = {k: int(math.floor(v)) for k, v in scaled.items()}
+    rem = remaining - sum(floored.values())
+
+    order = sorted(others, key=lambda k: scaled[k] - floored[k], reverse=True)
+    for i in range(rem):
+        floored[order[i % len(order)]] += 1
+
+    out = {k: 0 for k in keys}
+    out[changed_key] = new_value
+    for k in others:
+        out[k] = floored[k]
+    return out
+
+
+def percentages_to_counts(percentages: Dict[str, int], total: int) -> Dict[str, int]:
+    if total <= 0:
+        return {k: 0 for k in percentages}
+
+    raw = {k: percentages[k] * total / 100.0 for k in percentages}
+    base = {k: int(math.floor(v)) for k, v in raw.items()}
+    remainder = total - sum(base.values())
+
+    order = sorted(raw.keys(), key=lambda k: raw[k] - base[k], reverse=True)
+    for i in range(remainder):
+        base[order[i % len(order)]] += 1
+
+    return base
+
+
+def split_path_list(value: str) -> List[str]:
+    return [p.strip() for p in str(value).split(",") if p.strip()]
+
+
+def to_relpath(target: Path, base_dir: Path) -> str:
+    try:
+        return os.path.relpath(target, base_dir)
+    except Exception:
+        return str(target)
+
+
+def resolve_existing_paths(raw_value: str, original_cfg_dir: Path, scenario_cfg_dir: Path) -> List[str]:
+    resolved = []
+    for item in split_path_list(raw_value):
+        p = Path(item)
+        if not p.is_absolute():
+            p = (original_cfg_dir / p).resolve()
+        resolved.append(to_relpath(p, scenario_cfg_dir))
+    return resolved
+
+
+def merge_path_lists(existing: List[str], new_items: List[str]) -> List[str]:
+    merged = list(existing)
+    seen = {x.replace('\\', '/').lower() for x in existing}
+    for item in new_items:
+        key = item.replace('\\', '/').lower()
+        if key not in seen:
+            merged.append(item)
+            seen.add(key)
+    return merged
 
 
 # ============================================================================
@@ -229,9 +299,7 @@ def discover_available_slots(mapping_csv: str, csv_dir: str) -> Tuple[pd.DataFra
         except Exception as e:
             invalid.append({"csv_file": csv_name, "reason": str(e)})
 
-    slots_df = pd.DataFrame(rows)
-    invalid_df = pd.DataFrame(invalid)
-    return slots_df, invalid_df
+    return pd.DataFrame(rows), pd.DataFrame(invalid)
 
 
 @st.cache_data(show_spinner=False)
@@ -296,8 +364,7 @@ def build_edge_counts_for_slot(mapping_csv: str, csv_dir: str, target_date: str,
             entry[cfg["key"]] = count
         used_rows.append(entry)
 
-    used_df = pd.DataFrame(used_rows)
-    return mode_edge_counts, used_df
+    return mode_edge_counts, pd.DataFrame(used_rows)
 
 
 def write_edgedata_xml(edge_counts: Dict[str, int], out_file: Path, begin: int = 0, end: int = 3600) -> None:
@@ -326,9 +393,10 @@ def write_scaled_edgedata_files(mode_edge_counts: Dict[str, Dict[str, int]], sca
             raw = {edge: count * target_total / measured_total for edge, count in counts.items()}
             base = {edge: int(math.floor(v)) for edge, v in raw.items()}
             remainder = target_total - sum(base.values())
-            order = sorted(raw.keys(), key=lambda e: raw[e] - base[e], reverse=True)
-            for i in range(remainder):
-                base[order[i % len(order)]] += 1
+            if base:
+                order = sorted(raw.keys(), key=lambda e: raw[e] - base[e], reverse=True)
+                for i in range(remainder):
+                    base[order[i % len(order)]] += 1
             scaled_counts = {edge: val for edge, val in base.items() if val > 0}
 
         out_path = out_dir / cfg["edgedata_file"]
@@ -415,8 +483,9 @@ def generate_routes_for_mode(
         "--edgedata-attribute", "entered",
         "--write-flows", "number",
         "--attributes", f"type='{vtype_id}'",
+        "--prefix", str(vtype_id),
         "--total-count", str(total_count),
-        #"--optimize", "full",
+        "--optimize", "full",
         "--minimize-vehicles", "1",
         "--threads", threads,
         "--verbose",
@@ -428,20 +497,75 @@ def generate_routes_for_mode(
     return sampled_routes, res1.stdout + "\n" + res1.stderr + "\n" + res2.stdout + "\n" + res2.stderr
 
 
-def write_sumocfg(sumocfg_path: Path, net_file: Path, types_file: Path, route_files: List[Path], gui: bool) -> None:
-    root = ET.Element("configuration")
-    input_el = ET.SubElement(root, "input")
-    ET.SubElement(input_el, "net-file", {"value": str(net_file)})
-    ET.SubElement(input_el, "additional-files", {"value": str(types_file)})
-    ET.SubElement(input_el, "route-files", {"value": ",".join(str(p) for p in route_files)})
+def copy_and_patch_base_sumocfg(base_sumocfg: Path, out_sumocfg: Path, net_file: Path, types_file: Path, route_files: List[Path]) -> None:
+    """
+    Copy the existing base SUMO config, preserve its structure, and patch only the
+    path-based input entries so it works from the generated scenario folder.
 
-    time_el = ET.SubElement(root, "time")
-    ET.SubElement(time_el, "begin", {"value": "0"})
-    ET.SubElement(time_el, "end", {"value": "3600"})
+    Existing additional-files and route-files are preserved and kept alongside
+    the newly generated ones.
+    """
+    if not base_sumocfg.exists():
+        raise FileNotFoundError(f"Base SUMO config not found: {base_sumocfg}")
 
-    tree = ET.ElementTree(root)
+    ensure_dir(out_sumocfg.parent)
+    shutil.copy2(base_sumocfg, out_sumocfg)
+
+    tree = ET.parse(out_sumocfg)
+    root = tree.getroot()
+
+    input_el = root.find("input")
+    if input_el is None:
+        input_el = ET.SubElement(root, "input")
+
+    original_cfg_dir = base_sumocfg.parent.resolve()
+    scenario_cfg_dir = out_sumocfg.parent.resolve()
+
+    # net-file: always use the selected network, rewritten relative to scenario cfg
+    net_el = input_el.find("net-file")
+    if net_el is None:
+        net_el = ET.SubElement(input_el, "net-file")
+    net_el.set("value", to_relpath(net_file.resolve(), scenario_cfg_dir))
+
+    # additional-files: preserve existing ones, but rewrite paths relative to scenario cfg,
+    # then append the generated types.add.xml
+    add_el = input_el.find("additional-files")
+    existing_additional = []
+    if add_el is not None and add_el.get("value"):
+        existing_additional = resolve_existing_paths(add_el.get("value", ""), original_cfg_dir, scenario_cfg_dir)
+    if add_el is None:
+        add_el = ET.SubElement(input_el, "additional-files")
+    merged_additional = merge_path_lists(
+        existing_additional,
+        [to_relpath(types_file.resolve(), scenario_cfg_dir)]
+    )
+    add_el.set("value", ",".join(merged_additional))
+
+    # route-files: preserve existing ones if any, rewrite them, then append generated routes
+    routes_el = input_el.find("route-files")
+    # route-files: replace completely with the newly generated routes
+    routes_el = input_el.find("route-files")
+    if routes_el is None:
+        routes_el = ET.SubElement(input_el, "route-files")
+
+    generated_routes_rel = [to_relpath(p.resolve(), scenario_cfg_dir) for p in route_files]
+    routes_el.set("value", ",".join(generated_routes_rel))
+
+    # rewrite other common input file references relative to the new scenario cfg
+    for child in list(input_el):
+        if child.tag in {"net-file", "additional-files", "route-files"}:
+            continue
+        val = child.get("value")
+        if not val:
+            continue
+        parts = split_path_list(val)
+        if not parts:
+            continue
+        rewritten = resolve_existing_paths(val, original_cfg_dir, scenario_cfg_dir)
+        child.set("value", ",".join(rewritten))
+
     ET.indent(tree, space="  ", level=0)
-    tree.write(sumocfg_path, encoding="utf-8", xml_declaration=True)
+    tree.write(out_sumocfg, encoding="utf-8", xml_declaration=True)
 
 
 def build_scenario_paths(output_root: Path, selected_date: str, selected_hour: int) -> ScenarioPaths:
@@ -449,13 +573,18 @@ def build_scenario_paths(output_root: Path, selected_date: str, selected_hour: i
     root = output_root / scenario_name
     edgedata_dir = root / "edgedata"
     routes_dir = root / "routes"
+    output_dir = root / "output"
+
     ensure_dir(root)
     ensure_dir(edgedata_dir)
     ensure_dir(routes_dir)
+    ensure_dir(output_dir)
+
     return ScenarioPaths(
         root=root,
         edgedata_dir=edgedata_dir,
         routes_dir=routes_dir,
+        output_dir=output_dir,
         types_file=root / "types.add.xml",
         sumocfg_file=root / "scenario.sumocfg",
     )
@@ -467,6 +596,104 @@ def launch_sumo(sumo_bin_dir: Path, sumocfg_file: Path, gui: bool) -> subprocess
         raise FileNotFoundError(f"SUMO executable not found: {exe}")
     return subprocess.Popen([str(exe), "-c", str(sumocfg_file)])
 
+
+def on_percentage_change(changed_mode: str, mode_keys: List[str]) -> None:
+    current = dict(st.session_state["modal_percentages"])
+    new_value = int(st.session_state[f"slider_{changed_mode}"])
+    updated = rebalance_percentages(changed_mode, new_value, current)
+    st.session_state["modal_percentages"] = updated
+    for key in mode_keys:
+        st.session_state[f"slider_{key}"] = updated[key]
+
+
+def summarize_tripinfos_global(df: pd.DataFrame) -> dict:
+    if df.empty:
+        return {}
+
+    return {
+        "total_trips": int(df["id"].count()),
+        "avg_waitingTime": float(df["waitingTime"].mean()),
+        "avg_timeLoss": float(df["timeLoss"].mean()),
+        "avg_duration": float(df["duration"].mean()),
+        "avg_speed": float(df["avgSpeed"].mean()),
+        "avg_CO2_abs": float(df["CO2_abs"].mean()),
+        "avg_fuel_abs": float(df["fuel_abs"].mean()),
+    }
+
+def parse_tripinfos_xml(tripinfos_path: Path) -> pd.DataFrame:
+    tree = ET.parse(tripinfos_path)
+    root = tree.getroot()
+
+    rows = []
+
+    for trip in root.findall("tripinfo"):
+        row = {
+            "id": trip.attrib.get("id"),
+            "vType": trip.attrib.get("vType"),
+            "depart": float(trip.attrib.get("depart", 0)),
+            "arrival": float(trip.attrib.get("arrival", 0)),
+            "duration": float(trip.attrib.get("duration", 0)),
+            "routeLength": float(trip.attrib.get("routeLength", 0)),
+            "waitingTime": float(trip.attrib.get("waitingTime", 0)),
+            "waitingCount": float(trip.attrib.get("waitingCount", 0)),
+            "stopTime": float(trip.attrib.get("stopTime", 0)),
+            "timeLoss": float(trip.attrib.get("timeLoss", 0)),
+            "departDelay": float(trip.attrib.get("departDelay", 0)),
+            "speedFactor": float(trip.attrib.get("speedFactor", 0)),
+        }
+
+        emissions = trip.find("emissions")
+        if emissions is not None:
+            row.update({
+                "CO_abs": float(emissions.attrib.get("CO_abs", 0)),
+                "CO2_abs": float(emissions.attrib.get("CO2_abs", 0)),
+                "HC_abs": float(emissions.attrib.get("HC_abs", 0)),
+                "PMx_abs": float(emissions.attrib.get("PMx_abs", 0)),
+                "NOx_abs": float(emissions.attrib.get("NOx_abs", 0)),
+                "fuel_abs": float(emissions.attrib.get("fuel_abs", 0)),
+                "electricity_abs": float(emissions.attrib.get("electricity_abs", 0)),
+            })
+        else:
+            row.update({
+                "CO_abs": 0.0,
+                "CO2_abs": 0.0,
+                "HC_abs": 0.0,
+                "PMx_abs": 0.0,
+                "NOx_abs": 0.0,
+                "fuel_abs": 0.0,
+                "electricity_abs": 0.0,
+            })
+
+        row["avgSpeed"] = row["routeLength"] / row["duration"] if row["duration"] > 0 else 0.0
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+def summarize_tripinfos_by_vtype(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    summary = (
+        df.groupby("vType", dropna=False)
+        .agg(
+            trips=("id", "count"),
+            avg_waitingTime=("waitingTime", "mean"),
+            avg_timeLoss=("timeLoss", "mean"),
+            avg_duration=("duration", "mean"),
+            avg_routeLength=("routeLength", "mean"),
+            avg_speed=("avgSpeed", "mean"),
+            avg_CO_abs=("CO_abs", "mean"),
+            avg_CO2_abs=("CO2_abs", "mean"),
+            avg_HC_abs=("HC_abs", "mean"),
+            avg_PMx_abs=("PMx_abs", "mean"),
+            avg_NOx_abs=("NOx_abs", "mean"),
+            avg_fuel_abs=("fuel_abs", "mean"),
+            avg_electricity_abs=("electricity_abs", "mean"),
+        )
+        .reset_index()
+    )
+
+    return summary
 
 # ============================================================================
 # STREAMLIT UI
@@ -480,6 +707,7 @@ with st.sidebar:
     sumo_tools_path = st.text_input("SUMO tools path", DEFAULTS["sumo_tools_path"])
     sumo_bin_dir = st.text_input("SUMO bin path", DEFAULTS["sumo_bin_dir"])
     net_file = st.text_input("SUMO net file", DEFAULTS["net_file"])
+    base_sumocfg = st.text_input("Base SUMO config", DEFAULTS["base_sumocfg"])
     poi_edge_mapping = st.text_input("POI-edge mapping CSV", DEFAULTS["poi_edge_mapping"])
     csv_dir = st.text_input("Mapped TLC CSV folder", DEFAULTS["csv_dir"])
     output_dir = st.text_input("Scenario output folder", DEFAULTS["output_dir"])
@@ -515,10 +743,10 @@ with col_c:
 with st.expander("Availability summary", expanded=False):
     if not slots_df.empty:
         daily = slots_df.groupby("date")["csv_file"].nunique().reset_index(name="mapped_csv_available")
-        st.dataframe(daily, width='stretch')
+        st.dataframe(daily, use_container_width=True)
     if not invalid_df.empty:
         st.markdown("**Ignored mapped CSV files**")
-        st.dataframe(invalid_df, width='stretch')
+        st.dataframe(invalid_df, use_container_width=True)
 
 if not selected_date or selected_hour is None:
     st.warning("No valid date/hour combination available from the mapped CSV files.")
@@ -530,10 +758,11 @@ if st.button("Load measured edge counts", type="primary"):
     st.session_state["used_df"] = used_df
     st.session_state["selected_date"] = selected_date
     st.session_state["selected_hour"] = selected_hour
-
-if "mode_edge_counts" not in st.session_state:
-    st.info("Select a date and a one-hour slot, then click 'Load measured edge counts'.")
-    st.stop()
+    st.session_state["modal_percentages"] = None
+    for _, cfg in MODE_CONFIG.items():
+        slider_key = f"slider_{cfg['key']}"
+        if slider_key in st.session_state:
+            del st.session_state[slider_key]
 
 mode_edge_counts = st.session_state.get("mode_edge_counts", None)
 used_df = st.session_state.get("used_df", None)
@@ -556,6 +785,8 @@ mc1, mc2, mc3, mc4, mc5 = st.columns(5)
 for col, (_, cfg) in zip([mc1, mc2, mc3, mc4, mc5], MODE_CONFIG.items()):
     col.metric(cfg["key"], measured_totals[cfg["key"]])
 
+st.caption(f"Loaded slot: {loaded_date} | {loaded_hour:02d}:00 - {loaded_hour:02d}:59")
+
 with st.expander("CSV/edge rows used for this slot", expanded=False):
     st.dataframe(used_df, use_container_width=True)
 
@@ -563,23 +794,47 @@ st.subheader("Scenario scaling")
 default_total = measured_total_all if measured_total_all > 0 else 1000
 scenario_total = st.number_input("Total vehicles in scenario", min_value=0, value=int(default_total), step=50)
 
-# default weights from measurements
-if measured_total_all > 0:
-    default_weights = {cfg["key"]: max(1, measured_totals[cfg["key"]]) for _, cfg in MODE_CONFIG.items()}
-else:
-    default_weights = {cfg["key"]: int(cfg["default_ratio"] * 100) for _, cfg in MODE_CONFIG.items()}
+mode_keys = [cfg["key"] for _, cfg in MODE_CONFIG.items()]
+if st.session_state["modal_percentages"] is None:
+    if measured_total_all > 0:
+        init_percentages = {
+            cfg["key"]: measured_totals[cfg["key"]] * 100.0 / measured_total_all
+            for _, cfg in MODE_CONFIG.items()
+        }
+    else:
+        init_percentages = {
+            cfg["key"]: cfg["default_ratio"] * 100.0
+            for _, cfg in MODE_CONFIG.items()
+        }
 
-st.markdown("Adjust modal proportions. The final per-mode counts will always sum to the selected total.")
-slider_cols = st.columns(5)
-weights = {}
+    st.session_state["modal_percentages"] = normalize_percentages_to_100(init_percentages)
+    for key, value in st.session_state["modal_percentages"].items():
+        st.session_state[f"slider_{key}"] = value
+
+st.markdown("Adjust modal proportions. Percentages are shared and always sum to 100%.")
+st.caption("Changing one mode automatically redistributes the remaining share across the other modes.")
+
+slider_cols = st.columns(len(mode_keys))
 for slider_col, (_, cfg) in zip(slider_cols, MODE_CONFIG.items()):
     mode_key = cfg["key"]
-    weights[mode_key] = slider_col.slider(mode_key, min_value=0, max_value=100, value=min(100, int(default_weights[mode_key])), step=1)
+    with slider_col:
+        st.slider(
+            mode_key,
+            min_value=0,
+            max_value=100,
+            step=1,
+            key=f"slider_{mode_key}",
+            on_change=on_percentage_change,
+            args=(mode_key, mode_keys),
+        )
 
-scaled_totals = normalize_weights_to_total(weights, int(scenario_total))
+current_percentages = dict(st.session_state["modal_percentages"])
+scaled_totals = percentages_to_counts(current_percentages, int(scenario_total))
+
 preview_df = pd.DataFrame([
     {
         "mode": cfg["key"],
+        "percentage": current_percentages[cfg["key"]],
         "measured_total": measured_totals[cfg["key"]],
         "scenario_total": scaled_totals[cfg["key"]],
     }
@@ -590,15 +845,11 @@ st.dataframe(preview_df, use_container_width=True)
 st.subheader("Generate scenario")
 if st.button("Build edgeData, routes, and SUMO config", type="primary"):
     try:
-        scenario_paths = build_scenario_paths(Path(output_dir), selected_date, int(selected_hour))
+        scenario_paths = build_scenario_paths(Path(output_dir), loaded_date, int(loaded_hour))
 
-        # 1) write scaled edgeData
         edgedata_files = write_scaled_edgedata_files(mode_edge_counts, scaled_totals, scenario_paths.edgedata_dir)
-
-        # 2) write types.add.xml
         write_types_add_xml(scenario_paths.types_file)
 
-        # 3) generate route files
         route_files = []
         logs = {}
         for csv_mode, cfg in MODE_CONFIG.items():
@@ -628,16 +879,19 @@ if st.button("Build edgeData, routes, and SUMO config", type="primary"):
         if not route_files:
             raise RuntimeError("No route files were generated. Check the measured counts and modal split.")
 
-        # 4) sumocfg
-        write_sumocfg(scenario_paths.sumocfg_file, Path(net_file), scenario_paths.types_file, route_files, launch_gui)
+        copy_and_patch_base_sumocfg(
+            Path(base_sumocfg),
+            scenario_paths.sumocfg_file,
+            Path(net_file),
+            scenario_paths.types_file,
+            route_files,
+        )
 
         st.success(f"Scenario created in: {scenario_paths.root}")
         st.code(str(scenario_paths.root))
 
         st.markdown("**Generated files**")
-        generated = []
-        generated.append(str(scenario_paths.types_file))
-        generated.append(str(scenario_paths.sumocfg_file))
+        generated = [str(scenario_paths.types_file), str(scenario_paths.sumocfg_file)]
         generated.extend(str(p) for p in edgedata_files.values())
         generated.extend(str(p) for p in route_files)
         st.code("\n".join(generated))
@@ -650,6 +904,69 @@ if st.button("Build edgeData, routes, and SUMO config", type="primary"):
         if launch_gui:
             proc = launch_sumo(Path(sumo_bin_dir), scenario_paths.sumocfg_file, gui=True)
             st.info(f"SUMO-GUI launched (PID: {proc.pid})")
+
+    except Exception as e:
+        st.error(str(e))
+
+st.subheader("Simulation outputs")
+
+if st.button("Load simulation outputs"):
+    try:
+        scenario_paths = build_scenario_paths(Path(output_dir), loaded_date, int(loaded_hour))
+        tripinfos_path = scenario_paths.output_dir / "tripinfos.xml"
+
+        if not tripinfos_path.exists():
+            st.warning(f"tripinfos.xml not found: {tripinfos_path}")
+        else:
+            trip_df = parse_tripinfos_xml(tripinfos_path)
+
+            if trip_df.empty:
+                st.warning("tripinfos.xml was found, but it does not contain any tripinfo entries.")
+            else:
+                summary_df = summarize_tripinfos_by_vtype(trip_df)
+                global_kpis = summarize_tripinfos_global(trip_df)
+
+                st.success(f"Loaded simulation outputs from: {tripinfos_path}")
+
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Trips", global_kpis["total_trips"])
+                c2.metric("Avg waiting time", f"{global_kpis['avg_waitingTime']:.2f} s")
+                c3.metric("Avg time loss", f"{global_kpis['avg_timeLoss']:.2f} s")
+                c4.metric("Avg speed", f"{global_kpis['avg_speed']:.2f} m/s")
+
+                c5, c6 = st.columns(2)
+                c5.metric("Avg CO2", f"{global_kpis['avg_CO2_abs']:.2f}")
+                c6.metric("Avg fuel", f"{global_kpis['avg_fuel_abs']:.2f}")
+
+                st.markdown("**Tripinfo summary by vehicle type**")
+                st.dataframe(summary_df, use_container_width=True)
+
+                st.markdown("**Performance metrics**")
+                perf_cols = st.columns(2)
+                with perf_cols[0]:
+                    st.markdown("**Average waiting time by vehicle type**")
+                    st.bar_chart(summary_df.set_index("vType")["avg_waitingTime"], x_label="modality", y_label="s")
+                with perf_cols[1]:
+                    st.markdown("**Average time loss by vehicle type**")
+                    st.bar_chart(summary_df.set_index("vType")["avg_timeLoss"], x_label="modality", y_label="s")
+
+                st.markdown("**Mobility metrics**")
+                mob_cols = st.columns(2)
+                with mob_cols[0]:
+                    st.markdown("**Average trip duration by vehicle type**")
+                    st.bar_chart(summary_df.set_index("vType")["avg_duration"], x_label="modality", y_label="s")
+                with mob_cols[1]:
+                    st.markdown("**Average speed by vehicle type**")
+                    st.bar_chart(summary_df.set_index("vType")["avg_speed"], x_label="modality", y_label="m/s")
+
+                st.markdown("**Environmental metrics**")
+                env_cols = st.columns(2)
+                with env_cols[0]:
+                    st.markdown("**Average CO2 emissions by vehicle type**")
+                    st.bar_chart(summary_df.set_index("vType")["avg_CO2_abs"], x_label="modality", y_label="mg")
+                with env_cols[1]:
+                    st.markdown("**Average fuel consumption by vehicle type**")
+                    st.bar_chart(summary_df.set_index("vType")["avg_fuel_abs"],  x_label="modality", y_label="mg")
 
     except Exception as e:
         st.error(str(e))

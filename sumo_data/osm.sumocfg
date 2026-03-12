@@ -7,15 +7,31 @@
 
     <input>
         <net-file value="osm.net.xml"/>
-        <additional-files value="..\sumo_data\routes\types.add.xml, mapped_gis.add.xml " />
+        <additional-files value="mapped_gis.add.xml " />
         <route-files value="..\sumo_data\routes\bicycle\generatedRoutes_bicycle.rou.xml,..\sumo_data\routes\motorcycle\generatedRoutes_motorcycle.rou.xml,..\sumo_data\routes\passenger\generatedRoutes_passenger.rou.xml,..\sumo_data\routes\truck\generatedRoutes_truck.rou.xml,..\sumo_data\routes\bus\generatedRoutes_bus.rou.xml" />
 
     </input>
+	
+	<output>
+        <tripinfo-output value="./output/tripinfos.xml"/>
+        <save-state.prefix value="state"/>
+		<!--<fcd-output value="/output/fcd.xml"/> -->
+		<vehroute-output value="./output/vehroute.xml" />
+		<summary-output value="./output/summary.xml" />
+		<!--<queue-output value="../../${TYPEPATH}/output/queue.xml" /> -->
+		<edgedata-output value="./output/edgedata-output.xml" />
+		<emission-output value="./output/emission-output.xml" />
+    </output>
+	
 
     <processing>
         <ignore-route-errors value="true"/>
         <tls.actuated.jam-threshold value="30"/>
+		<time-to-teleport value="5"/> 
+		<ignore-junction-blocker value="1"/>
     </processing>
+	
+	
 
     <routing>
         <device.rerouting.adaptation-steps value="18"/>
@@ -28,8 +44,8 @@
         <no-step-log value="true"/>
     </report>
 
-    <gui_only>
+    <!--<gui_only>
         <gui-settings-file value="osm.view.xml"/>
-    </gui_only>
+    </gui_only> -->
 
 </sumoConfiguration>
