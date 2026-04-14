@@ -42,6 +42,7 @@ for each CSV file, along with:
 This table is later used to create SUMO POIs associated with the traffic
 measurement locations.
 """
+import os
 from pathlib import Path
 import re
 import unicodedata
@@ -58,6 +59,8 @@ except ImportError:
 
 SHAPE_DIR = Path(r"../gis_data/TLC")
 CSV_DIR = Path(r"../sensor_measures_castellammare")
+if not os.path.exists("../processed"):
+    os.makedirs("../processed")
 OUTPUT_CSV = Path(r"../processed/csv_shapefile_matches.csv")
 
 MIN_FUZZY_SCORE = 60

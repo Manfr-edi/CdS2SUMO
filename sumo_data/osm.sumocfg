@@ -7,7 +7,7 @@
 
     <input>
         <net-file value="osm.net.xml"/>
-        <additional-files value="mapped_gis.add.xml " />
+        <additional-files value="../../processed/matched_csv_pois.add.xml " />
         <route-files value="..\sumo_data\routes\bicycle\generatedRoutes_bicycle.rou.xml,..\sumo_data\routes\motorcycle\generatedRoutes_motorcycle.rou.xml,..\sumo_data\routes\passenger\generatedRoutes_passenger.rou.xml,..\sumo_data\routes\truck\generatedRoutes_truck.rou.xml,..\sumo_data\routes\bus\generatedRoutes_bus.rou.xml" />
 
     </input>
@@ -27,7 +27,7 @@
     <processing>
         <ignore-route-errors value="true"/>
         <tls.actuated.jam-threshold value="30"/>
-		<time-to-teleport value="5"/> 
+		<time-to-teleport value="10"/>
 		<ignore-junction-blocker value="1"/>
     </processing>
 	

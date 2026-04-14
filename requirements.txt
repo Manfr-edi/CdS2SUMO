@@ -3,3 +3,5 @@ shapely
 streamlit
 pandas
 scipy
+sumolib
+matplotlib

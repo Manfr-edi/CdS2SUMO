@@ -28,7 +28,7 @@ import sumolib
 # CONFIG
 # =========================
 NET_FILE = r"../sumo_data/osm.net.xml"
-POI_FILE = r"./matched_csv_pois.add.xml"
+POI_FILE = r"../processed/matched_csv_pois.add.xml"
 OUT_MAPPING_CSV = r"../processed/poi_edge_mapping.csv"
 OUT_POI_ENRICHED = r"../processed/matched_csv_pois_with_edges.add.xml"
 

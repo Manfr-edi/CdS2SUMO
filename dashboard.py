@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import math
 import os
+import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -23,21 +25,53 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
+from matplotlib.collections import LineCollection
+from matplotlib.colors import LogNorm
 
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 BASE_DIR = Path(__file__).resolve().parent
+HEATMAP_CO2_VMIN = 1e4
+HEATMAP_CO2_VMAX = 1e7
+
+
+def get_default_sumo_paths() -> Tuple[str, str]:
+    system = platform.system().lower()
+
+    if system == "windows":
+        return (
+            r"C:/Program Files (x86)/Eclipse/Sumo/tools",
+            r"C:/Program Files (x86)/Eclipse/Sumo/bin",
+        )
+
+    if system == "linux":
+        tools_path = Path("/usr/share/sumo/tools")
+        bin_dir = Path("/usr/bin")
+        if not tools_path.exists() and Path("/usr/share/sumo").exists():
+            tools_path = Path("/usr/share/sumo") / "tools"
+        if not (bin_dir / "sumo").exists() and (Path("/usr/share/sumo") / "bin").exists():
+            bin_dir = Path("/usr/share/sumo") / "bin"
+        return (str(tools_path), str(bin_dir))
+
+    return (
+        r"C:/Program Files (x86)/Eclipse/Sumo/tools",
+        r"C:/Program Files (x86)/Eclipse/Sumo/bin",
+    )
+
+
+DEFAULT_SUMO_TOOLS_PATH, DEFAULT_SUMO_BIN_DIR = get_default_sumo_paths()
 
 DEFAULTS = {
-    "sumo_tools_path": r"C:/Program Files (x86)/Eclipse/Sumo/tools",
-    "sumo_bin_dir": r"C:/Program Files (x86)/Eclipse/Sumo/bin",
+    "sumo_tools_path": DEFAULT_SUMO_TOOLS_PATH,
+    "sumo_bin_dir": DEFAULT_SUMO_BIN_DIR,
     "net_file": str(BASE_DIR / "sumo_data" / "osm.net.xml"),
     "base_sumocfg": str(BASE_DIR / "sumo_data" / "osm.sumocfg"),
-    "poi_edge_mapping": str(BASE_DIR / "pre-processing" / "poi_edge_mapping.csv"),
+    "poi_edge_mapping": str(BASE_DIR / "processed" / "poi_edge_mapping.csv"),
     "csv_dir": str(BASE_DIR / "sensor_measures_castellammare"),
     "output_dir": str(BASE_DIR / "scenario_output"),
 }
@@ -219,12 +253,32 @@ def to_relpath(target: Path, base_dir: Path) -> str:
         return str(target)
 
 
+def resolve_input_path(item: str, original_cfg_dir: Path) -> Path:
+    p = Path(item)
+    if p.is_absolute():
+        return p.resolve()
+
+    candidates = [(original_cfg_dir / p).resolve()]
+
+    rel_parts = list(p.parts)
+    while rel_parts and rel_parts[0] == "..":
+        rel_parts = rel_parts[1:]
+        if rel_parts:
+            candidates.append((BASE_DIR / Path(*rel_parts)).resolve())
+
+    candidates.append((BASE_DIR / p.name).resolve())
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    return candidates[0]
+
+
 def resolve_existing_paths(raw_value: str, original_cfg_dir: Path, scenario_cfg_dir: Path) -> List[str]:
     resolved = []
     for item in split_path_list(raw_value):
-        p = Path(item)
-        if not p.is_absolute():
-            p = (original_cfg_dir / p).resolve()
+        p = resolve_input_path(item, original_cfg_dir)
         resolved.append(to_relpath(p, scenario_cfg_dir))
     return resolved
 
@@ -591,7 +645,10 @@ def build_scenario_paths(output_root: Path, selected_date: str, selected_hour: i
 
 
 def launch_sumo(sumo_bin_dir: Path, sumocfg_file: Path, gui: bool) -> subprocess.Popen:
-    exe = sumo_bin_dir / ("sumo-gui.exe" if gui else "sumo.exe")
+    exe_name = "sumo-gui.exe" if gui else "sumo.exe"
+    if platform.system().lower() != "windows":
+        exe_name = "sumo-gui" if gui else "sumo"
+    exe = sumo_bin_dir / exe_name
     if not exe.exists():
         raise FileNotFoundError(f"SUMO executable not found: {exe}")
     return subprocess.Popen([str(exe), "-c", str(sumocfg_file)])
@@ -617,6 +674,7 @@ def summarize_tripinfos_global(df: pd.DataFrame) -> dict:
         "avg_duration": float(df["duration"].mean()),
         "avg_speed": float(df["avgSpeed"].mean()),
         "avg_CO2_abs": float(df["CO2_abs"].mean()),
+        "avg_CO_abs": float(df["CO_abs"].mean()),
         "avg_fuel_abs": float(df["fuel_abs"].mean()),
     }
 
@@ -695,11 +753,372 @@ def summarize_tripinfos_by_vtype(df: pd.DataFrame) -> pd.DataFrame:
 
     return summary
 
+
+def build_metric_bar_figure(summary_df: pd.DataFrame, metric: str, title: str, y_title: str):
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    chart_df = summary_df[["vType", metric]].copy()
+    ax.bar(chart_df["vType"], chart_df[metric], color="#2a6f97")
+    ax.set_title(title)
+    ax.set_xlabel("Vehicle type")
+    ax.set_ylabel(y_title)
+    ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    return fig
+
+
+def build_metric_histogram_figure(df: pd.DataFrame, metric: str, title: str, x_title: str):
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    series = pd.to_numeric(df[metric], errors="coerce").dropna()
+    ax.hist(series, bins=20, color="#bc4749", edgecolor="white")
+    ax.set_title(title)
+    ax.set_xlabel(x_title)
+    ax.set_ylabel("Trips")
+    ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    return fig
+
+
+def lane_to_edge_id(lane_id: str) -> str:
+    if not lane_id:
+        return ""
+    return re.sub(r"_[0-9]+$", "", str(lane_id))
+
+
+def parse_emission_by_edge(emission_output_path: Path) -> pd.DataFrame:
+    tree = ET.parse(emission_output_path)
+    rows = []
+
+    for timestep in tree.getroot().findall("timestep"):
+        for vehicle in timestep.findall("vehicle"):
+            edge_id = lane_to_edge_id(vehicle.attrib.get("lane", ""))
+            if not edge_id or edge_id.startswith(":"):
+                continue
+            rows.append({
+                "edge_id": edge_id,
+                "CO2": float(vehicle.attrib.get("CO2", 0)),
+                "CO": float(vehicle.attrib.get("CO", 0)),
+                "HC": float(vehicle.attrib.get("HC", 0)),
+                "NOx": float(vehicle.attrib.get("NOx", 0)),
+                "PMx": float(vehicle.attrib.get("PMx", 0)),
+                "fuel": float(vehicle.attrib.get("fuel", 0)),
+                "waiting": float(vehicle.attrib.get("waiting", 0)),
+            })
+
+    if not rows:
+        return pd.DataFrame(columns=["edge_id", "CO2", "CO", "HC", "NOx", "PMx", "fuel", "waiting"])
+
+    return pd.DataFrame(rows).groupby("edge_id", as_index=False).sum()
+
+
+def build_network_metric_heatmap_figure(net_file: Path, edge_metric_df: pd.DataFrame, metric: str, title: str):
+    try:
+        import sumolib
+    except ImportError as e:
+        raise RuntimeError("sumolib is required to generate network heatmaps.") from e
+
+    net = sumolib.net.readNet(str(net_file))
+    all_segments = []
+    for edge in net.getEdges():
+        if edge.getID().startswith(":"):
+            continue
+        shape = edge.getShape()
+        if len(shape) >= 2:
+            all_segments.append(shape)
+
+    metric_map = {
+        str(row["edge_id"]): float(row[metric])
+        for _, row in edge_metric_df.iterrows()
+        if pd.notna(row.get(metric, None)) and float(row[metric]) > 0
+    }
+
+    colored_segments = []
+    colored_values = []
+    for edge_id, value in metric_map.items():
+        try:
+            edge = net.getEdge(edge_id)
+        except Exception:
+            continue
+        if edge is None or edge.getID().startswith(":"):
+            continue
+        shape = edge.getShape()
+        if len(shape) >= 2:
+            colored_segments.append(shape)
+            colored_values.append(value)
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    if all_segments:
+        background = LineCollection(all_segments, colors="#d9d9d9", linewidths=0.4, alpha=0.8)
+        ax.add_collection(background)
+
+    if colored_segments:
+        values_series = pd.Series(colored_values, dtype=float)
+        positive_values = values_series[values_series > 0]
+
+        if metric == "CO2":
+            vmin = HEATMAP_CO2_VMIN
+            vmax = HEATMAP_CO2_VMAX
+        else:
+            min_positive = float(positive_values.min()) if not positive_values.empty else 1.0
+            vmax = float(positive_values.max()) if not positive_values.empty else 1.0
+            vmin = max(min_positive, 1e-6)
+            vmax = max(vmax, vmin * 1.01)
+
+        clipped_values = values_series.clip(lower=vmin, upper=vmax).tolist()
+
+        norm = LogNorm(vmin=vmin, vmax=vmax)
+        overlay = LineCollection(colored_segments, cmap="inferno", norm=norm, linewidths=2.0)
+        overlay.set_array(clipped_values)
+        ax.add_collection(overlay)
+        cbar = fig.colorbar(overlay, ax=ax, fraction=0.03, pad=0.01)
+        if metric == "CO2":
+            cbar.set_label(f"{metric} (fixed log scale: 1e4 to 1e6)")
+        else:
+            cbar.set_label(f"{metric} (log scale)")
+
+    ax.autoscale()
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_title(title)
+    ax.set_axis_off()
+    fig.tight_layout()
+    return fig
+
+
+def build_network_segments(net_file: Path, edge_metric_df: pd.DataFrame, metric: str):
+    try:
+        import sumolib
+    except ImportError as e:
+        raise RuntimeError("sumolib is required to generate network heatmaps.") from e
+
+    net = sumolib.net.readNet(str(net_file))
+    all_segments = []
+    for edge in net.getEdges():
+        if edge.getID().startswith(":"):
+            continue
+        shape = edge.getShape()
+        if len(shape) >= 2:
+            all_segments.append(shape)
+
+    colored_segments = []
+    colored_values = []
+    for _, row in edge_metric_df.iterrows():
+        value = float(row.get(metric, 0))
+        if value <= 0:
+            continue
+        try:
+            edge = net.getEdge(str(row["edge_id"]))
+        except Exception:
+            continue
+        if edge is None or edge.getID().startswith(":"):
+            continue
+        shape = edge.getShape()
+        if len(shape) >= 2:
+            colored_segments.append(shape)
+            colored_values.append(value)
+
+    return all_segments, colored_segments, colored_values
+
+
+def get_metric_norm(metric: str, values: List[float]) -> LogNorm:
+    if metric == "CO2":
+        return LogNorm(vmin=HEATMAP_CO2_VMIN, vmax=HEATMAP_CO2_VMAX)
+
+    positive_values = pd.Series(values, dtype=float)
+    positive_values = positive_values[positive_values > 0]
+    min_positive = float(positive_values.min()) if not positive_values.empty else 1.0
+    vmax = float(positive_values.max()) if not positive_values.empty else 1.0
+    vmin = max(min_positive, 1e-6)
+    vmax = max(vmax, vmin * 1.01)
+    return LogNorm(vmin=vmin, vmax=vmax)
+
+
+def draw_network_heatmap(ax, all_segments, colored_segments, colored_values, norm: LogNorm, title: str):
+    if all_segments:
+        background = LineCollection(all_segments, colors="#8d8d8d", linewidths=0.8, alpha=0.8)
+        ax.add_collection(background)
+
+    overlay = None
+    if colored_segments:
+        clipped_values = pd.Series(colored_values, dtype=float).clip(lower=norm.vmin, upper=norm.vmax).tolist()
+        overlay = LineCollection(colored_segments, cmap="plasma", norm=norm, linewidths=2.0)
+        overlay.set_array(clipped_values)
+        ax.add_collection(overlay)
+
+    ax.autoscale()
+
+    # 🔍 ZOOM IN
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+
+    zoom_factor = 0.5  # prova 0.8 o 0.7 se vuoi più zoom
+
+    x_center = (xlim[0] + xlim[1]) / 2
+    y_center = (ylim[0] + ylim[1]) / 2
+
+    x_range = (xlim[1] - xlim[0]) * zoom_factor
+    y_range = (ylim[1] - ylim[0]) * zoom_factor
+
+    ax.set_xlim(x_center - x_range / 2, x_center + x_range / 2)
+    ax.set_ylim(y_center - y_range / 2, y_center + y_range / 2)
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_title(title)
+    ax.set_axis_off()
+    return overlay
+
+
+def build_comparison_heatmaps_figure(net_file: Path, left_df: pd.DataFrame, right_df: pd.DataFrame, metric: str, left_title: str, right_title: str):
+    left_all_segments, left_colored_segments, left_values = build_network_segments(net_file, left_df, metric)
+    right_all_segments, right_colored_segments, right_values = build_network_segments(net_file, right_df, metric)
+    norm = get_metric_norm(metric, left_values + right_values)
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    overlay_left = draw_network_heatmap(axes[0], left_all_segments, left_colored_segments, left_values, norm, left_title)
+    overlay_right = draw_network_heatmap(axes[1], right_all_segments, right_colored_segments, right_values, norm, right_title)
+
+    overlay_for_cbar = overlay_left or overlay_right
+    if overlay_for_cbar is not None:
+        # cbar = fig.colorbar(overlay_for_cbar, ax=axes, fraction=0.03, pad=0.02)
+        cbar_ax = fig.add_axes([0.25, 0.08, 0.5, 0.03])  # [left, bottom, width, height]
+        cbar = fig.colorbar(overlay_for_cbar, cax=cbar_ax, orientation="horizontal")
+        if metric == "CO2":
+            # cbar.set_label(f"{metric} (fixed log scale: 1e4 to 1e6)")
+            cbar.set_label(f"{metric} (mg)")
+        else:
+            cbar.set_label(f"{metric} (log scale)")
+
+    fig.suptitle(f"{metric} heatmap comparison", y=0.98)
+    fig.tight_layout()
+    return fig
+
+
+def build_kpi_comparison_figure(left_name: str, right_name: str, left_kpis: dict, right_kpis: dict):
+    metrics = [
+        ("avg_waitingTime", "Avg waiting time", "s"),
+        # ("avg_timeLoss", "Avg time loss", "s"),
+        ("avg_speed", "Avg speed", "m/s"),
+        ("avg_CO2_abs", "Avg CO2", "mg"),
+        ("avg_CO_abs", "Avg CO", "mg"),
+        # ("avg_fuel_abs", "Avg fuel"),
+    ]
+    n_cols = 2
+    n_rows = math.ceil(len(metrics) / n_cols)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(10, 6))
+    axes = axes.flatten()
+    for ax, (metric, label, unit) in zip(axes, metrics):
+        ax.bar(["01-26:08 am", "01-26:11 pm"], [left_kpis.get(metric, 0), right_kpis.get(metric, 0)], color=["#2a6f97", "#bc4749"])
+        ax.set_title(label)
+        ax.set_ylabel(unit)
+        ax.tick_params(axis="x", rotation=20)
+        ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    return fig
+
+
+def list_available_scenarios(output_root: Path) -> List[str]:
+    if not output_root.exists():
+        return []
+
+    scenarios = []
+    for path in sorted(output_root.iterdir()):
+        if not path.is_dir():
+            continue
+        if (path / "output" / "tripinfos.xml").exists():
+            scenarios.append(path.name)
+    return scenarios
+
+
+def load_scenario_results(scenario_root: Path):
+    output_path = scenario_root / "output"
+    tripinfos_path = output_path / "tripinfos.xml"
+    emission_output_path = output_path / "emission-output.xml"
+
+    if not tripinfos_path.exists():
+        raise FileNotFoundError(f"tripinfos.xml not found: {tripinfos_path}")
+
+    trip_df = parse_tripinfos_xml(tripinfos_path)
+    if trip_df.empty:
+        raise RuntimeError(f"No tripinfo entries found in: {tripinfos_path}")
+
+    summary_df = summarize_tripinfos_by_vtype(trip_df)
+    global_kpis = summarize_tripinfos_global(trip_df)
+    edge_emissions_df = parse_emission_by_edge(emission_output_path) if emission_output_path.exists() else pd.DataFrame()
+    return trip_df, summary_df, global_kpis, edge_emissions_df
+
+
+def save_figure(fig, out_path: Path) -> Path:
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_tripinfo_reports(
+    output_dir: Path,
+    trip_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    global_kpis: dict,
+    net_file: Path,
+    emission_output_path: Path,
+) -> List[Path]:
+    ensure_dir(output_dir)
+    reports_dir = output_dir / "reports"
+    ensure_dir(reports_dir)
+
+    saved_files = []
+
+    summary_csv = reports_dir / "tripinfo_summary_by_vtype.csv"
+    summary_df.to_csv(summary_csv, index=False)
+    saved_files.append(summary_csv)
+
+    global_csv = reports_dir / "tripinfo_global_kpis.csv"
+    pd.DataFrame([global_kpis]).to_csv(global_csv, index=False)
+    saved_files.append(global_csv)
+
+    bar_specs = [
+        ("avg_waitingTime", "Average waiting time by vehicle type", "Waiting time (s)", "waiting_time_by_vtype.png"),
+        ("avg_timeLoss", "Average time loss by vehicle type", "Time loss (s)", "time_loss_by_vtype.png"),
+        ("avg_duration", "Average trip duration by vehicle type", "Duration (s)", "duration_by_vtype.png"),
+        ("avg_speed", "Average speed by vehicle type", "Speed (m/s)", "speed_by_vtype.png"),
+        ("avg_CO2_abs", "Average CO2 emissions by vehicle type", "CO2 (mg)", "co2_by_vtype.png"),
+        ("avg_CO_abs", "Average CO emissions by vehicle type", "CO (mg)", "co_by_vtype.png"),
+        ("avg_fuel_abs", "Average fuel consumption by vehicle type", "Fuel (mg/s)", "fuel_by_vtype.png"),
+    ]
+    for metric, title, y_title, filename in bar_specs:
+        fig = build_metric_bar_figure(summary_df, metric, title, y_title)
+        out_path = reports_dir / filename
+        saved_files.append(save_figure(fig, out_path))
+
+    hist_specs = [
+        ("waitingTime", "Waiting time distribution", "Waiting time (s)", "waiting_time_histogram.png"),
+        ("timeLoss", "Time loss distribution", "Time loss (s)", "time_loss_histogram.png"),
+        ("duration", "Trip duration distribution", "Duration (s)", "duration_histogram.png"),
+        ("avgSpeed", "Average speed distribution", "Speed (m/s)", "speed_histogram.png"),
+        ("CO2_abs", "CO2 distribution", "CO2 (mg)", "co2_histogram.png"),
+        ("CO_abs", "CO distribution", "CO (mg)", "co_histogram.png"),
+        ("fuel_abs", "Fuel consumption distribution", "Fuel (mg/s)", "fuel_histogram.png"),
+    ]
+    for metric, title, x_title, filename in hist_specs:
+        fig = build_metric_histogram_figure(trip_df, metric, title, x_title)
+        out_path = reports_dir / filename
+        saved_files.append(save_figure(fig, out_path))
+
+    if emission_output_path.exists():
+        edge_emissions_df = parse_emission_by_edge(emission_output_path)
+        edge_emissions_csv = reports_dir / "edge_emissions_summary.csv"
+        edge_emissions_df.sort_values("CO2", ascending=False).to_csv(edge_emissions_csv, index=False)
+        saved_files.append(edge_emissions_csv)
+
+        if not edge_emissions_df.empty:
+            heatmap_path = reports_dir / "network_co2_heatmap.png"
+            fig = build_network_metric_heatmap_figure(net_file, edge_emissions_df, "CO2", "Network CO2 heatmap")
+            saved_files.append(save_figure(fig, heatmap_path))
+
+    return saved_files
+
 # ============================================================================
 # STREAMLIT UI
 # ============================================================================
 st.set_page_config(page_title="SUMO Scenario Builder", layout="wide")
-st.title("SUMO Scenario Builder")
+st.title("Scenario Reconstruction")
 st.caption("Create one-hour multimodal SUMO scenarios from mapped TLC measurements.")
 
 with st.sidebar:
@@ -842,131 +1261,257 @@ preview_df = pd.DataFrame([
 ])
 st.dataframe(preview_df, use_container_width=True)
 
-st.subheader("Generate scenario")
-if st.button("Build edgeData, routes, and SUMO config", type="primary"):
-    try:
-        scenario_paths = build_scenario_paths(Path(output_dir), loaded_date, int(loaded_hour))
+tab_run, tab_compare = st.tabs(["Run & Analyze", "Compare Simulations"])
 
-        edgedata_files = write_scaled_edgedata_files(mode_edge_counts, scaled_totals, scenario_paths.edgedata_dir)
-        write_types_add_xml(scenario_paths.types_file)
+with tab_run:
+    st.subheader("Generate scenario")
+    if st.button("Build edgeData, routes, and SUMO config", type="primary"):
+        try:
+            scenario_paths = build_scenario_paths(Path(output_dir), loaded_date, int(loaded_hour))
 
-        route_files = []
-        logs = {}
-        for csv_mode, cfg in MODE_CONFIG.items():
-            mode_key = cfg["key"]
-            edgedata_file = edgedata_files[mode_key]
-            if parse_total_from_edgedata(edgedata_file) <= 0:
-                continue
+            edgedata_files = write_scaled_edgedata_files(mode_edge_counts, scaled_totals, scenario_paths.edgedata_dir)
+            write_types_add_xml(scenario_paths.types_file)
 
-            route_file, log_text = generate_routes_for_mode(
-                sumo_tools_path=Path(sumo_tools_path),
-                net_file=Path(net_file),
-                edgedata_file=edgedata_file,
-                out_dir=scenario_paths.routes_dir,
-                mode_label=csv_mode,
-                vtype_id=cfg["vtype_id"],
-                vclass=cfg["vclass"],
-                period=random_period,
-                fringe_factor=fringe_factor,
-                min_distance=min_distance,
-                max_distance=max_distance,
-                routing_factor=routing_factor,
-                threads=threads,
+            route_files = []
+            logs = {}
+            for csv_mode, cfg in MODE_CONFIG.items():
+                mode_key = cfg["key"]
+                edgedata_file = edgedata_files[mode_key]
+                if parse_total_from_edgedata(edgedata_file) <= 0:
+                    continue
+
+                route_file, log_text = generate_routes_for_mode(
+                    sumo_tools_path=Path(sumo_tools_path),
+                    net_file=Path(net_file),
+                    edgedata_file=edgedata_file,
+                    out_dir=scenario_paths.routes_dir,
+                    mode_label=csv_mode,
+                    vtype_id=cfg["vtype_id"],
+                    vclass=cfg["vclass"],
+                    period=random_period,
+                    fringe_factor=fringe_factor,
+                    min_distance=min_distance,
+                    max_distance=max_distance,
+                    routing_factor=routing_factor,
+                    threads=threads,
+                )
+                route_files.append(route_file)
+                logs[mode_key] = log_text
+
+            if not route_files:
+                raise RuntimeError("No route files were generated. Check the measured counts and modal split.")
+
+            copy_and_patch_base_sumocfg(
+                Path(base_sumocfg),
+                scenario_paths.sumocfg_file,
+                Path(net_file),
+                scenario_paths.types_file,
+                route_files,
             )
-            route_files.append(route_file)
-            logs[mode_key] = log_text
 
-        if not route_files:
-            raise RuntimeError("No route files were generated. Check the measured counts and modal split.")
+            st.success(f"Scenario created in: {scenario_paths.root}")
+            st.code(str(scenario_paths.root))
 
-        copy_and_patch_base_sumocfg(
-            Path(base_sumocfg),
-            scenario_paths.sumocfg_file,
-            Path(net_file),
-            scenario_paths.types_file,
-            route_files,
-        )
+            st.markdown("**Generated files**")
+            generated = [str(scenario_paths.types_file), str(scenario_paths.sumocfg_file)]
+            generated.extend(str(p) for p in edgedata_files.values())
+            generated.extend(str(p) for p in route_files)
+            st.code("\n".join(generated))
 
-        st.success(f"Scenario created in: {scenario_paths.root}")
-        st.code(str(scenario_paths.root))
+            with st.expander("Generation logs", expanded=False):
+                for mode_key, text in logs.items():
+                    st.markdown(f"**{mode_key}**")
+                    st.text(text[:20000])
 
-        st.markdown("**Generated files**")
-        generated = [str(scenario_paths.types_file), str(scenario_paths.sumocfg_file)]
-        generated.extend(str(p) for p in edgedata_files.values())
-        generated.extend(str(p) for p in route_files)
-        st.code("\n".join(generated))
+            if launch_gui:
+                proc = launch_sumo(Path(sumo_bin_dir), scenario_paths.sumocfg_file, gui=True)
+                st.info(f"SUMO-GUI launched (PID: {proc.pid})")
 
-        with st.expander("Generation logs", expanded=False):
-            for mode_key, text in logs.items():
-                st.markdown(f"**{mode_key}**")
-                st.text(text[:20000])
+        except Exception as e:
+            st.error(str(e))
 
-        if launch_gui:
-            proc = launch_sumo(Path(sumo_bin_dir), scenario_paths.sumocfg_file, gui=True)
-            st.info(f"SUMO-GUI launched (PID: {proc.pid})")
+    st.subheader("Simulation outputs")
 
-    except Exception as e:
-        st.error(str(e))
+    if st.button("Load simulation outputs"):
+        try:
+            scenario_paths = build_scenario_paths(Path(output_dir), loaded_date, int(loaded_hour))
+            tripinfos_path = scenario_paths.output_dir / "tripinfos.xml"
 
-st.subheader("Simulation outputs")
-
-if st.button("Load simulation outputs"):
-    try:
-        scenario_paths = build_scenario_paths(Path(output_dir), loaded_date, int(loaded_hour))
-        tripinfos_path = scenario_paths.output_dir / "tripinfos.xml"
-
-        if not tripinfos_path.exists():
-            st.warning(f"tripinfos.xml not found: {tripinfos_path}")
-        else:
-            trip_df = parse_tripinfos_xml(tripinfos_path)
-
-            if trip_df.empty:
-                st.warning("tripinfos.xml was found, but it does not contain any tripinfo entries.")
+            if not tripinfos_path.exists():
+                st.warning(f"tripinfos.xml not found: {tripinfos_path}")
             else:
-                summary_df = summarize_tripinfos_by_vtype(trip_df)
-                global_kpis = summarize_tripinfos_global(trip_df)
+                trip_df = parse_tripinfos_xml(tripinfos_path)
 
-                st.success(f"Loaded simulation outputs from: {tripinfos_path}")
+                if trip_df.empty:
+                    st.warning("tripinfos.xml was found, but it does not contain any tripinfo entries.")
+                else:
+                    summary_df = summarize_tripinfos_by_vtype(trip_df)
+                    global_kpis = summarize_tripinfos_global(trip_df)
+                    emission_output_path = scenario_paths.output_dir / "emission-output.xml"
+                    saved_report_files = save_tripinfo_reports(
+                        scenario_paths.output_dir,
+                        trip_df,
+                        summary_df,
+                        global_kpis,
+                        Path(net_file),
+                        emission_output_path,
+                    )
 
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Trips", global_kpis["total_trips"])
-                c2.metric("Avg waiting time", f"{global_kpis['avg_waitingTime']:.2f} s")
-                c3.metric("Avg time loss", f"{global_kpis['avg_timeLoss']:.2f} s")
-                c4.metric("Avg speed", f"{global_kpis['avg_speed']:.2f} m/s")
+                    st.success(f"Loaded simulation outputs from: {tripinfos_path}")
 
-                c5, c6 = st.columns(2)
-                c5.metric("Avg CO2", f"{global_kpis['avg_CO2_abs']:.2f}")
-                c6.metric("Avg fuel", f"{global_kpis['avg_fuel_abs']:.2f}")
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Trips", global_kpis["total_trips"])
+                    c2.metric("Avg waiting time", f"{global_kpis['avg_waitingTime']:.2f} s")
+                    c3.metric("Avg time loss", f"{global_kpis['avg_timeLoss']:.2f} s")
+                    c4.metric("Avg speed", f"{global_kpis['avg_speed']:.2f} m/s")
 
-                st.markdown("**Tripinfo summary by vehicle type**")
-                st.dataframe(summary_df, use_container_width=True)
+                    c5, c6 = st.columns(2)
+                    c5.metric("Avg CO2", f"{global_kpis['avg_CO2_abs']:.2f}")
+                    c6.metric("Avg fuel", f"{global_kpis['avg_fuel_abs']:.2f}")
 
-                st.markdown("**Performance metrics**")
-                perf_cols = st.columns(2)
-                with perf_cols[0]:
-                    st.markdown("**Average waiting time by vehicle type**")
-                    st.bar_chart(summary_df.set_index("vType")["avg_waitingTime"], x_label="modality", y_label="s")
-                with perf_cols[1]:
-                    st.markdown("**Average time loss by vehicle type**")
-                    st.bar_chart(summary_df.set_index("vType")["avg_timeLoss"], x_label="modality", y_label="s")
+                    st.markdown("**Tripinfo summary by vehicle type**")
+                    st.dataframe(summary_df, use_container_width=True)
 
-                st.markdown("**Mobility metrics**")
-                mob_cols = st.columns(2)
-                with mob_cols[0]:
-                    st.markdown("**Average trip duration by vehicle type**")
-                    st.bar_chart(summary_df.set_index("vType")["avg_duration"], x_label="modality", y_label="s")
-                with mob_cols[1]:
-                    st.markdown("**Average speed by vehicle type**")
-                    st.bar_chart(summary_df.set_index("vType")["avg_speed"], x_label="modality", y_label="m/s")
+                    with st.expander("Saved report files", expanded=False):
+                        st.code("\n".join(str(path) for path in saved_report_files))
 
-                st.markdown("**Environmental metrics**")
-                env_cols = st.columns(2)
-                with env_cols[0]:
-                    st.markdown("**Average CO2 emissions by vehicle type**")
-                    st.bar_chart(summary_df.set_index("vType")["avg_CO2_abs"], x_label="modality", y_label="mg")
-                with env_cols[1]:
-                    st.markdown("**Average fuel consumption by vehicle type**")
-                    st.bar_chart(summary_df.set_index("vType")["avg_fuel_abs"],  x_label="modality", y_label="mg")
+                    st.markdown("**Performance metrics**")
+                    perf_cols = st.columns(2)
+                    with perf_cols[0]:
+                        st.markdown("**Average waiting time by vehicle type**")
+                        st.pyplot(build_metric_bar_figure(summary_df, "avg_waitingTime", "Average waiting time by vehicle type", "Waiting time (s)"))
+                    with perf_cols[1]:
+                        st.markdown("**Average time loss by vehicle type**")
+                        st.pyplot(build_metric_bar_figure(summary_df, "avg_timeLoss", "Average time loss by vehicle type", "Time loss (s)"))
 
-    except Exception as e:
-        st.error(str(e))
+                    st.markdown("**Mobility metrics**")
+                    mob_cols = st.columns(2)
+                    with mob_cols[0]:
+                        st.markdown("**Average trip duration by vehicle type**")
+                        st.pyplot(build_metric_bar_figure(summary_df, "avg_duration", "Average trip duration by vehicle type", "Duration (s)"))
+                    with mob_cols[1]:
+                        st.markdown("**Average speed by vehicle type**")
+                        st.pyplot(build_metric_bar_figure(summary_df, "avg_speed", "Average speed by vehicle type", "Speed (m/s)"))
+
+                    st.markdown("**Environmental metrics**")
+                    env_cols = st.columns(2)
+                    with env_cols[0]:
+                        st.markdown("**Average CO2 emissions by vehicle type**")
+                        st.pyplot(build_metric_bar_figure(summary_df, "avg_CO2_abs", "Average CO2 emissions by vehicle type", "CO2 (mg/s)"))
+                    with env_cols[1]:
+                        st.markdown("**Average fuel consumption by vehicle type**")
+                        st.pyplot(build_metric_bar_figure(summary_df, "avg_fuel_abs", "Average fuel consumption by vehicle type", "Fuel (mg/s)"))
+
+                    st.markdown("**Distributions**")
+                    dist_cols = st.columns(2)
+                    with dist_cols[0]:
+                        st.markdown("**Waiting time distribution**")
+                        st.pyplot(build_metric_histogram_figure(trip_df, "waitingTime", "Waiting time distribution", "Waiting time (s)"))
+                        st.markdown("**Trip duration distribution**")
+                        st.pyplot(build_metric_histogram_figure(trip_df, "duration", "Trip duration distribution", "Duration (s)"))
+                        st.markdown("**CO2 distribution**")
+                        st.pyplot(build_metric_histogram_figure(trip_df, "CO2_abs", "CO2 distribution", "CO2 (mg/s)"))
+                    with dist_cols[1]:
+                        st.markdown("**Time loss distribution**")
+                        st.pyplot(build_metric_histogram_figure(trip_df, "timeLoss", "Time loss distribution", "Time loss (s)"))
+                        st.markdown("**Average speed distribution**")
+                        st.pyplot(build_metric_histogram_figure(trip_df, "avgSpeed", "Average speed distribution", "Speed (m/s)"))
+                        st.markdown("**Fuel consumption distribution**")
+                        st.pyplot(build_metric_histogram_figure(trip_df, "fuel_abs", "Fuel consumption distribution", "Fuel (mg/s)"))
+
+                    if emission_output_path.exists():
+                        st.markdown("**Network CO2 heatmap**")
+                        edge_emissions_df = parse_emission_by_edge(emission_output_path)
+                        if edge_emissions_df.empty:
+                            st.info("Emission output was found, but no non-internal edge emissions were available.")
+                        else:
+                            st.pyplot(build_network_metric_heatmap_figure(Path(net_file), edge_emissions_df, "CO2", "Network CO2 heatmap"))
+
+        except Exception as e:
+            st.error(str(e))
+
+with tab_compare:
+    st.subheader("Scenario comparison")
+    available_scenarios = list_available_scenarios(Path(output_dir))
+    if len(available_scenarios) < 2:
+        st.info("At least two completed scenarios with `output/tripinfos.xml` are required to compare simulations.")
+    else:
+        compare_cols = st.columns(2)
+        with compare_cols[0]:
+            left_scenario = st.selectbox("Scenario A", options=available_scenarios, index=0, key="compare_left_scenario")
+        with compare_cols[1]:
+            default_right_index = 1 if len(available_scenarios) > 1 else 0
+            right_scenario = st.selectbox("Scenario B", options=available_scenarios, index=default_right_index, key="compare_right_scenario")
+
+        if left_scenario == right_scenario:
+            st.warning("Select two different scenarios to compare.")
+        else:
+            try:
+                left_root = Path(output_dir) / left_scenario
+                right_root = Path(output_dir) / right_scenario
+                left_trip_df, left_summary_df, left_kpis, left_edge_emissions_df = load_scenario_results(left_root)
+                right_trip_df, right_summary_df, right_kpis, right_edge_emissions_df = load_scenario_results(right_root)
+
+                kpi_cols = st.columns(4)
+                kpi_cols[0].metric("Trips delta", f"{left_kpis['total_trips'] - right_kpis['total_trips']:+d}")
+                kpi_cols[1].metric("Waiting delta", f"{left_kpis['avg_waitingTime'] - right_kpis['avg_waitingTime']:+.2f} s")
+                kpi_cols[2].metric("CO2 delta", f"{left_kpis['avg_CO2_abs'] - right_kpis['avg_CO2_abs']:+.2f}")
+                kpi_cols[3].metric("CO delta", f"{left_kpis['avg_CO_abs'] - right_kpis['avg_CO_abs']:+.2f}")
+                # kpi_cols[3].metric("Fuel delta", f"{left_kpis['avg_fuel_abs'] - right_kpis['avg_fuel_abs']:+.2f}")
+
+                st.markdown("**Global KPI comparison**")
+                st.pyplot(build_kpi_comparison_figure(left_scenario, right_scenario, left_kpis, right_kpis))
+
+                comparison_rows = []
+                for metric, label in [
+                    ("total_trips", "Trips"),
+                    ("avg_waitingTime", "Avg waiting time"),
+                    ("avg_timeLoss", "Avg time loss"),
+                    ("avg_duration", "Avg duration"),
+                    ("avg_speed", "Avg speed"),
+                    ("avg_CO2_abs", "Avg CO2"),
+                    ("avg_CO_abs", "Avg CO"),
+                    ("avg_fuel_abs", "Avg fuel"),
+                ]:
+                    comparison_rows.append({
+                        "metric": label,
+                        left_scenario: left_kpis.get(metric, 0),
+                        right_scenario: right_kpis.get(metric, 0),
+                        "delta_A_minus_B": left_kpis.get(metric, 0) - right_kpis.get(metric, 0),
+                    })
+                st.dataframe(pd.DataFrame(comparison_rows), use_container_width=True)
+
+                st.markdown("**CO2 heatmap comparison**")
+                if left_edge_emissions_df.empty or right_edge_emissions_df.empty:
+                    st.info("Both scenarios need `emission-output.xml` with usable edge emissions for the heatmap comparison.")
+                else:
+                    st.pyplot(
+                        build_comparison_heatmaps_figure(
+                            Path(net_file),
+                            left_edge_emissions_df,
+                            right_edge_emissions_df,
+                            "CO2",
+                            left_scenario,
+                            right_scenario,
+                        )
+                    )
+
+                st.markdown("**Vehicle-type comparison**")
+                merged_summary = left_summary_df.merge(
+                    right_summary_df,
+                    on="vType",
+                    how="outer",
+                    suffixes=(f"_{left_scenario}", f"_{right_scenario}"),
+                ).fillna(0)
+                st.dataframe(merged_summary, use_container_width=True)
+
+                hist_cols = st.columns(2)
+                with hist_cols[0]:
+                    st.markdown(f"**{left_scenario} CO2 distribution**")
+                    st.pyplot(build_metric_histogram_figure(left_trip_df, "CO2_abs", f"{left_scenario} CO2 distribution", "CO2 (mg/s)"))
+                with hist_cols[1]:
+                    st.markdown(f"**{right_scenario} CO2 distribution**")
+                    st.pyplot(build_metric_histogram_figure(right_trip_df, "CO2_abs", f"{right_scenario} CO2 distribution", "CO2 (mg/s)"))
+
+            except Exception as e:
+                st.error(str(e))
